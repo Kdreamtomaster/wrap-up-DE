@@ -1,8 +1,8 @@
 
-# Kubeflow DAG 작성법
+# Kubeflow DAG 작성법 및 모델 등록, 추론 엔드포인트 서빙 및 접근 방법
 
 Kubeflow Pipelines는 머신러닝 워크플로우를 정의하고 실행할 수 있는 플랫폼으로, 워크플로우는 DAG(Directed Acyclic Graph)로 구성됩니다.  
-이 문서에서는 Kubeflow Pipelines에서 DAG를 작성하는 방법과 기본 구조를 설명합니다.
+또한 학습된 모델을 등록하고 추론을 위한 엔드포인트로 서빙할 수 있으며, HTTP 요청을 통해 추론 엔드포인트에 접근할 수 있습니다. 이 문서에서는 DAG 작성법과 함께 모델 등록, 서빙, 그리고 엔드포인트 접근 방법에 대해 설명합니다.
 
 ---
 
@@ -38,39 +38,74 @@ def preprocess_op(data_path: str) -> str:
     return processed_data_path
 ```
 
-#### Docker 컨테이너로 Component 정의:
-Component를 Docker 컨테이너로 정의하려면 YAML 파일로 설정합니다.
-```yaml
-name: preprocess
-inputs:
-  - {name: data_path, type: String}
-outputs:
-  - {name: processed_data_path, type: String}
-implementation:
-  container:
-    image: my-docker-image
-    command:
-      - python
-      - preprocess.py
-```
+---
 
-### 2.3 Pipeline 작성
-Pipeline은 Component 간의 관계를 정의하는 함수입니다.
+## 3. 모델 등록 및 추론 엔드포인트 서빙
 
+### 3.1 모델 등록
+
+Kubeflow는 학습된 모델을 저장하고 관리하기 위해 모델 레지스트리를 제공합니다.
+
+#### 모델 등록을 위한 Component 작성:
 ```python
-from kfp.v2.dsl import pipeline
-
-@pipeline(name="my_pipeline")
-def my_pipeline(data_path: str):
-    preprocess_task = preprocess_op(data_path=data_path)
-    # 추가 작업 연결 가능
+@component
+def register_model_op(model_path: str, model_name: str):
+    import kfp
+    # 모델 등록 로직 작성
+    print(f"Registering model: {model_name} at {model_path}")
 ```
 
 ---
 
-## 3. Kubeflow DAG 작성 예제
+### 3.2 추론 엔드포인트 서빙
 
-### 데이터 전처리 → 모델 학습 → 평가 파이프라인 예제
+Kubeflow Serving(KServe)을 사용하여 모델을 엔드포인트로 서빙합니다.
+
+#### 서빙을 위한 Component 작성:
+```python
+@component
+def deploy_model_op(model_name: str, version: str):
+    import requests
+    # KServe 배포 로직 작성
+    print(f"Deploying model: {model_name}, version: {version}")
+```
+
+---
+
+### 3.3 추론 엔드포인트 접근
+
+#### 엔드포인트 요청을 위한 Component 작성:
+```python
+@component
+def predict_op(endpoint: str, input_data: dict) -> dict:
+    import requests
+    response = requests.post(endpoint, json=input_data)
+    return response.json()
+```
+
+#### 예제 엔드포인트 호출:
+- 엔드포인트 URL: `http://example-model.default.svc.cluster.local/v1/models/example-model:predict`
+- 입력 데이터(JSON 형식):
+  ```json
+  {
+      "instances": [[1.0, 2.0, 3.0]]
+  }
+  ```
+
+#### Python 코드로 추론 요청:
+```python
+import requests
+
+endpoint = "http://example-model.default.svc.cluster.local/v1/models/example-model:predict"
+input_data = {"instances": [[1.0, 2.0, 3.0]]}
+
+response = requests.post(endpoint, json=input_data)
+print("Prediction:", response.json())
+```
+
+---
+
+## 4. 데이터 전처리 → 모델 학습 → 등록 → 서빙 → 추론 요청 DAG 예제
 
 ```python
 from kfp.v2.dsl import pipeline, component
@@ -86,68 +121,58 @@ def train_op(processed_data_path: str) -> str:
     return model_path
 
 @component
-def evaluate_op(model_path: str, test_data_path: str) -> float:
-    accuracy = 0.95  # 평가 로직
-    return accuracy
+def register_model_op(model_path: str, model_name: str):
+    print(f"Registering model: {model_name} at {model_path}")
 
-@pipeline(name="ml_pipeline")
-def ml_pipeline(data_path: str, test_data_path: str):
+@component
+def deploy_model_op(model_name: str, version: str):
+    print(f"Deploying model: {model_name}, version: {version}")
+
+@component
+def predict_op(endpoint: str, input_data: dict) -> dict:
+    import requests
+    response = requests.post(endpoint, json=input_data)
+    return response.json()
+
+@pipeline(name="ml_pipeline_with_serving_and_inference")
+def ml_pipeline_with_serving_and_inference(data_path: str, model_name: str, version: str, input_data: dict):
     preprocess_task = preprocess_op(data_path=data_path)
     train_task = train_op(processed_data_path=preprocess_task.output)
-    evaluate_task = evaluate_op(
-        model_path=train_task.output, test_data_path=test_data_path
+    register_task = register_model_op(
+        model_path=train_task.output, model_name=model_name
+    )
+    deploy_task = deploy_model_op(
+        model_name=model_name, version=version
+    )
+    predict_task = predict_op(
+        endpoint=f"http://{model_name}.default.svc.cluster.local/v1/models/{model_name}:predict",
+        input_data=input_data
     )
 ```
 
 ---
 
-## 4. Kubeflow Pipeline 실행
+## 5. Kubeflow Pipeline 실행
 
-### 4.1 파이프라인 컴파일
+### 5.1 파이프라인 컴파일
 Kubeflow 파이프라인을 실행하기 전에 컴파일해야 합니다.
 ```python
 from kfp.v2 import compiler
 
 compiler.Compiler().compile(
-    pipeline_func=ml_pipeline,
-    package_path="ml_pipeline.json"
+    pipeline_func=ml_pipeline_with_serving_and_inference,
+    package_path="ml_pipeline_with_serving_and_inference.json"
 )
 ```
 
-### 4.2 Kubeflow Pipelines UI에 업로드
+### 5.2 Kubeflow Pipelines UI에 업로드
 1. Kubeflow Pipelines 대시보드에 접속.
 2. **Upload Pipeline** 버튼 클릭.
-3. `ml_pipeline.json` 파일을 업로드하여 실행.
-
----
-
-## 5. 추가 설정
-
-### 5.1 입력 매개변수
-Pipeline 함수에 매개변수를 추가하여 사용자 입력을 받을 수 있습니다.
-```python
-@pipeline(name="parameterized_pipeline")
-def parameterized_pipeline(data_path: str, num_epochs: int):
-    preprocess_task = preprocess_op(data_path=data_path)
-    train_task = train_op(processed_data_path=preprocess_task.output, num_epochs=num_epochs)
-```
-
-### 5.2 환경 변수 설정
-Component 실행 시 필요한 환경 변수를 설정하려면 `container_op`에서 설정합니다.
-```python
-from kfp.dsl import ContainerOp
-
-op = ContainerOp(
-    name="example",
-    image="my-image",
-    command=["python", "script.py"],
-)
-op.container.set_env_variable("ENV_VAR", "value")
-```
+3. `ml_pipeline_with_serving_and_inference.json` 파일을 업로드하여 실행.
 
 ---
 
 ## 6. 결론
 
-Kubeflow Pipelines를 사용하면 DAG 형태의 머신러닝 워크플로우를 손쉽게 정의하고 관리할 수 있습니다.  
-Python SDK를 활용하여 Component와 Pipeline을 정의하고, Kubeflow UI를 통해 실행 및 모니터링할 수 있습니다.
+Kubeflow Pipelines와 KServe를 활용하면 데이터 전처리, 모델 학습, 등록, 서빙, 추론 요청까지 하나의 통합된 워크플로우를 구현할 수 있습니다.  
+HTTP 요청을 통해 추론 엔드포인트에 접근할 수 있으며, 이를 통해 모델을 실시간 서비스로 제공할 수 있습니다.
